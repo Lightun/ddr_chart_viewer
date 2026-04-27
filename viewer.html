@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>DDR Chart Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d0d1a;
+      color: #ddd;
+      font-family: 'Segoe UI', sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #controls {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      padding: 9px 20px;
+      background: #161628;
+      width: 100%;
+      flex-shrink: 0;
+      border-bottom: 1px solid #2a2a44;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 5px 14px;
+      background: #3535aa;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:hover { background: #4545cc; }
+    .ctrl { display: flex; align-items: center; gap: 7px; font-size: 13px; }
+    input[type=number] {
+      width: 62px;
+      background: #1e1e36;
+      border: 1px solid #3a3a5a;
+      color: #fff;
+      border-radius: 3px;
+      padding: 3px 6px;
+      font-size: 13px;
+    }
+    select {
+      background: #1e1e36;
+      border: 1px solid #3a3a5a;
+      color: #fff;
+      border-radius: 3px;
+      padding: 3px 6px;
+      font-size: 13px;
+    }
+    input[type=range] { width: 90px; accent-color: #4545cc; }
+    #songInfo { font-size: 12px; color: #aaa; white-space: nowrap; }
+    #timeDisp { margin-left: auto; font-size: 12px; color: #666; white-space: nowrap; }
+    #timeline { display: block; width: 100%; height: 72px; flex-shrink: 0; cursor: pointer; background: #111120; border-bottom: 1px solid #2a2a44; }
+    #canvasWrap { flex: 1; display: flex; justify-content: center; overflow: hidden; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+
+<div id="controls">
+  <span style="font-size:14px;font-weight:bold;color:#8899cc;letter-spacing:.05em;white-space:nowrap;">DDR Chart Viewer</span>
+
+  <button id="playBtn">▶ Play</button>
+  <button id="resetBtn">⟳ Reset</button>
+
+  <div class="ctrl">
+    難易度
+    <select id="chartSelect">
+      <option value="0">Beginner (Single)</option>
+      <option value="1">Basic (Single)</option>
+      <option value="2">Difficult (Single)</option>
+      <option value="3" selected>Expert (Single)</option>
+      <option value="5">Basic (Double)</option>
+      <option value="6">Difficult (Double)</option>
+      <option value="7">Expert (Double)</option>
+    </select>
+  </div>
+
+  <div class="ctrl">
+    BPM <span id="bpmDisp" style="min-width:42px;text-align:right;font-variant-numeric:tabular-nums;">150</span>
+  </div>
+
+  <div class="ctrl">
+    Scroll
+    <input type="range" id="scrollSlider" min="100" max="900" value="350" step="25">
+    <span id="scrollLabel">350</span> px/s
+  </div>
+
+  <div class="ctrl">
+    Speed
+    <input type="range" id="speedSlider" min="25" max="150" value="100" step="5">
+    <span id="speedLabel">1.00</span>x
+  </div>
+
+  <div class="ctrl">
+    曲
+    <select id="songSelect"></select>
+  </div>
+
+  <div class="ctrl">
+    Turn
+    <select id="turnSelect">
+      <option value="none">OFF</option>
+      <option value="mirror">MIRROR</option>
+      <option value="left">LEFT</option>
+      <option value="right">RIGHT</option>
+    </select>
+  </div>
+
+  <span id="songInfo"></span>
+  <div id="timeDisp">0.00 s</div>
+</div>
+
+<div id="canvasWrap">
+  <canvas id="chart"></canvas>
+</div>
+
+<canvas id="timeline"></canvas>
+
+<!-- 曲データ: 曲を追加するたびに songs/<name>.js を追加してください -->
+<script src="songs/iwu.js"></script>
+
+<script>
+// ─── Layout ──────────────────────────────────────────────────────────────────
+const LANE_W     = 80;
+const MARGIN     = 30;
+const RECEPTOR_Y = 80;
+const NOTE_SIZE  = 70;  // draw size for note / receptor sprites
+
+// ─── Sprite sheet: _Down Tap Note 8x8.png ───────────────────────────────────
+// 8 cols × 8 rows. Each frame = naturalWidth/8 × naturalHeight/8.
+// Row index by note color:
+//   Row 0 = red  (4th notes)
+//   Row 1 = blue (8th notes)
+//   Row 3 = yellow (16th notes)
+//   Row 4 = green (others)
+const SPRITE_COLS = 8;
+const SPRITE_ROWS = 8;
+const SPRITE_COL  = 0;  // animation frame: use first (brightest) frame
+
+// Sprite arrow points DOWN ↓. Rotate per lane to correct direction.
+// Point (0, r) rotated by θ: x'=-r·sin(θ), y'=r·cos(θ)
+// Left ← : tip → (-r,0) → sin(θ)=1  → θ=+π/2
+// Down ↓ : tip → ( 0,r) → θ=0
+// Up  ↑ : tip → ( 0,-r)→ cos(θ)=-1 → θ=π
+// Right→ : tip → ( r,0) → sin(θ)=-1 → θ=-π/2
+const SPRITE_ROT = [Math.PI / 2, 0, Math.PI, -Math.PI / 2]; // [Left, Down, Up, Right]
+
+// Hold body images indexed by lane % 4
+const HOLD_IMG_KEY = ['holdLeft', 'holdDown', 'holdUp', 'holdRight'];
+
+// Fallback lane colors (used if images not loaded)
+const LANE_COL = ['#D03030', '#3060D8', '#C8A820', '#28A840'];
+
+// ─── State ───────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('chart');
+const ctx    = canvas.getContext('2d');
+
+const tlCanvas = document.getElementById('timeline');
+const tlCtx    = tlCanvas.getContext('2d');
+
+let notes          = [];
+let baseBpm        = 150;
+let speedMult      = 1.0;
+let scrollSpeed    = 350;
+let chartEndT      = 0;
+let nLanes         = 4;
+let isPlaying      = false;
+let startTime      = null;
+let pausedAt       = 0;
+let prevT          = 0;
+let rafId          = null;
+let notesPerMeasure = [];
+let totalMeasures   = 0;
+let turnMode        = 'none';
+
+// lane remap tables for 4-lane (LDUR = 0123)
+const TURN_MAP = {
+  none:   [0, 1, 2, 3],
+  mirror: [3, 2, 1, 0],
+  left:   [1, 3, 0, 2],
+  right:  [2, 0, 3, 1],
+};
+
+function remapLane(lane) {
+  const map = TURN_MAP[turnMode] ?? TURN_MAP.none;
+  const group = Math.floor(lane / 4) * 4;   // Double用: 4レーンごとにグループ
+  return group + map[lane % 4];
+}
+
+// ─── Audio ────────────────────────────────────────────────────────────────────
+let clapAudio = null;
+
+async function initAudio() {
+  if (clapAudio) return;
+  clapAudio = new Audio('hand_clap.mp3');
+  await new Promise((resolve) => {
+    clapAudio.oncanplaythrough = resolve;
+    clapAudio.onerror = () => { console.error('Clap audio load failed'); resolve(); };
+    clapAudio.load();
+  });
+}
+
+function playClap() {
+  if (!clapAudio) return;
+  const clone = clapAudio.cloneNode();
+  clone.play().catch(() => {});
+}
+
+// 前フレームから今フレームの間に判定ラインを通過したノートを検出してクラップを鳴らす
+function checkClaps(from, to) {
+  const times = new Set();
+  for (const n of notes) {
+    if (n.t > from && n.t <= to) times.add(n.t);
+  }
+  times.forEach(() => playClap());
+}
+
+// ─── Image loading ───────────────────────────────────────────────────────────
+const img = {};
+
+function loadImage(key, src) {
+  return new Promise(resolve => {
+    const el = new Image();
+    el.onload  = () => { img[key] = el; resolve(); };
+    el.onerror = () => resolve();   // gracefully skip missing images
+    el.src = src;
+  });
+}
+
+const imagesReady = Promise.all([
+  loadImage('tapNote',   'notes/_Down Tap Note 8x8.png'),
+  loadImage('tapFlash',  'notes/_Down Tap Flash.png'),
+  loadImage('holdDown',  'notes/Down Hold Body Active.png'),
+  loadImage('holdLeft',  'notes/Left Hold Body Active.png'),
+  loadImage('holdUp',    'notes/Up Hold Body Active.png'),
+  loadImage('holdRight', 'notes/Right Hold Body Active.png'),
+]);
+
+// ─── Canvas sizing ───────────────────────────────────────────────────────────
+function canvasW() { return nLanes * LANE_W + MARGIN * 2; }
+
+function resizeCanvas() {
+  canvas.width  = canvasW();
+  canvas.height = document.getElementById('canvasWrap').clientHeight;
+}
+resizeCanvas();
+window.addEventListener('resize', () => {
+  resizeCanvas();
+  resizeTimeline();
+  if (!isPlaying) { drawFrame(pausedAt); drawTimeline(pausedAt); }
+});
+
+// ─── UI elements ─────────────────────────────────────────────────────────────
+const playBtn     = document.getElementById('playBtn');
+const resetBtn    = document.getElementById('resetBtn');
+const chartSelect = document.getElementById('chartSelect');
+const bpmDisp      = document.getElementById('bpmDisp');
+const scrollSlider = document.getElementById('scrollSlider');
+const scrollLabel  = document.getElementById('scrollLabel');
+const speedSlider  = document.getElementById('speedSlider');
+const speedLabel   = document.getElementById('speedLabel');
+const timeDisp    = document.getElementById('timeDisp');
+const songSelect  = document.getElementById('songSelect');
+const turnSelect  = document.getElementById('turnSelect');
+const songInfo    = document.getElementById('songInfo');
+
+// ─── Note color: sprite row by beat subdivision ───────────────────────────────
+// fraction = ri / numRows → determines SM standard coloring
+function spriteRow(ri, numRows) {
+  const frac = ri / numRows;
+  const EPS  = 0.001;
+  const near = (targets) => targets.some(f => Math.abs(frac - f) < EPS);
+
+  if (near([0, 0.25, 0.5, 0.75]))                                      return 0; // 4th  → red
+  if (near([0.125, 0.375, 0.625, 0.875]))                               return 1; // 8th  → blue
+  if (near([0.0625,0.1875,0.3125,0.4375,0.5625,0.6875,0.8125,0.9375])) return 3; // 16th → yellow
+  return 4;                                                                       // other→ green
+}
+
+// ─── Note parsing ─────────────────────────────────────────────────────────────
+// data.notes[chartIdx][measureIdx][rowIdx] = "LDUR" string
+// 75 measures × 4 rows each = quarter-note resolution
+function parseBPM(bpmsField) {
+  return (bpmsField?.length) ? (parseFloat(bpmsField[0][1]) || 150) : 150;
+}
+
+function parseNotes(chartData, numLanes) {
+  const measureDur = (60 / baseBpm) * 4;
+  const result     = [];
+  const holds      = new Array(numLanes).fill(null);
+
+  chartData.forEach((measure, mi) => {
+    if (!measure) return;
+    const numRows = measure.length;
+
+    measure.forEach((rowStr, ri) => {
+      if (!rowStr) return;
+      const t = mi * measureDur + (ri / numRows) * measureDur;
+
+      for (let lane = 0; lane < numLanes; lane++) {
+        const v = rowStr[lane];
+        if (v === '1') {
+          result.push({ t, lane, type: 'tap', ri, numRows });
+        } else if (v === '2') {
+          const n = { t, lane, type: 'hold', ri, numRows, endT: null };
+          result.push(n);
+          holds[lane] = n;
+        } else if (v === '3' && holds[lane]) {
+          holds[lane].endT = t;
+          holds[lane] = null;
+        }
+      }
+    });
+  });
+
+  return result;
+}
+
+// ─── Timeline ─────────────────────────────────────────────────────────────────
+function resizeTimeline() {
+  tlCanvas.width  = tlCanvas.clientWidth;
+  tlCanvas.height = tlCanvas.clientHeight;
+}
+
+function buildTimeline() {
+  const measureDur = (60 / baseBpm) * 4;
+  totalMeasures = Math.max(1, Math.ceil(chartEndT / measureDur) + 1);
+  notesPerMeasure = new Array(totalMeasures).fill(0);
+  for (const n of notes) {
+    const m = Math.floor(n.t / measureDur);
+    if (m >= 0 && m < totalMeasures) notesPerMeasure[m]++;
+  }
+}
+
+function drawTimeline(currentT) {
+  const W        = tlCanvas.width;
+  const H        = tlCanvas.height;
+  const PAD_LEFT = 28;   // Y軸ラベル用
+  const PAD_TOP  = 6;
+  const PAD_BOT  = 16;
+  const barH     = H - PAD_TOP - PAD_BOT;
+  const barArea  = W - PAD_LEFT;
+
+  tlCtx.clearRect(0, 0, W, H);
+  tlCtx.fillStyle = '#111120';
+  tlCtx.fillRect(0, 0, W, H);
+
+  if (totalMeasures === 0) return;
+
+  const Y_MAX  = 20;   // 縦軸固定上限
+  const barW   = barArea / totalMeasures;
+
+  // Y-axis grid & labels (0, 5, 10, 15, 20)
+  tlCtx.font      = '9px monospace';
+  tlCtx.textAlign = 'right';
+  for (let v = 0; v <= Y_MAX; v += 5) {
+    const y = PAD_TOP + barH - (v / Y_MAX) * barH;
+    tlCtx.fillStyle   = '#557799';
+    tlCtx.fillText(v, PAD_LEFT - 3, y + 3);
+    tlCtx.strokeStyle = '#222234';
+    tlCtx.lineWidth   = 0.5;
+    tlCtx.beginPath();
+    tlCtx.moveTo(PAD_LEFT, y);
+    tlCtx.lineTo(W, y);
+    tlCtx.stroke();
+  }
+
+  // Bars (all grey, 1px gap between each)
+  for (let m = 0; m < totalMeasures; m++) {
+    const x     = PAD_LEFT + m * barW;
+    const count = Math.min(notesPerMeasure[m], Y_MAX);
+    const h     = (count / Y_MAX) * barH;
+    tlCtx.fillStyle = '#555570';
+    tlCtx.fillRect(Math.floor(x) + 0.5, PAD_TOP + barH - h, Math.max(Math.ceil(barW) - 1, 1), h);
+  }
+
+  // Measure number labels (every 5 measures)
+  tlCtx.fillStyle = '#557799';
+  tlCtx.font      = '10px monospace';
+  tlCtx.textAlign = 'center';
+  for (let m = 5; m < totalMeasures; m += 5) {
+    const x = PAD_LEFT + (m / totalMeasures) * barArea;
+    tlCtx.fillText(m, x, H - 2);
+  }
+
+  // Time labels (start / end)
+  const fmt = s => {
+    const m = Math.floor(s / 60);
+    return m + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+  };
+  tlCtx.textAlign = 'left';
+  tlCtx.fillStyle = '#557799';
+  tlCtx.fillText(fmt(0), PAD_LEFT, H - 2);
+  tlCtx.textAlign = 'right';
+  tlCtx.fillText(fmt(chartEndT), W - 2, H - 2);
+
+  // Playhead
+  const measureDur = (60 / baseBpm) * 4;
+  const playX = PAD_LEFT + Math.round((currentT / (totalMeasures * measureDur)) * barArea);
+  tlCtx.strokeStyle = '#ffffff';
+  tlCtx.lineWidth   = 2;
+  tlCtx.beginPath();
+  tlCtx.moveTo(playX, 0);
+  tlCtx.lineTo(playX, H - PAD_BOT);
+  tlCtx.stroke();
+}
+
+function seekToX(x) {
+  const PAD_LEFT  = 28;
+  const barArea   = tlCanvas.width - PAD_LEFT;
+  const measureDur = (60 / baseBpm) * 4;
+  const t = Math.max(0, ((x - PAD_LEFT) / barArea) * totalMeasures * measureDur);
+  pausedAt = t;
+  prevT    = t;
+  if (isPlaying) {
+    startTime = performance.now() - (pausedAt / speedMult) * 1000;
+  } else {
+    drawFrame(pausedAt);
+  }
+  drawTimeline(pausedAt);
+}
+
+let tlDragging = false;
+tlCanvas.addEventListener('mousedown', e => { tlDragging = true; seekToX(e.offsetX); });
+tlCanvas.addEventListener('mousemove', e => { if (tlDragging) seekToX(e.offsetX); });
+tlCanvas.addEventListener('mouseup',   () => { tlDragging = false; });
+tlCanvas.addEventListener('mouseleave',() => { tlDragging = false; });
+
+// ─── Chart loading ───────────────────────────────────────────────────────────
+function loadChart(idx) {
+  const allCharts = window._allCharts;
+  if (!allCharts) return;
+
+  const chartData = allCharts[idx];
+  if (!chartData) { alert('このチャートのデータがありません'); return; }
+
+  const sampleRow = chartData[0]?.[0] ?? '';
+  nLanes = (sampleRow.length === 8) ? 8 : 4;
+  resizeCanvas();
+
+  notes     = parseNotes(chartData, nLanes);
+  chartEndT = notes.reduce((m, n) => Math.max(m, n.endT ?? n.t), 0);
+  buildTimeline();
+  reset();
+}
+
+function reloadNotes() {
+  const idx = parseInt(chartSelect.value);
+  const chartData = window._allCharts?.[idx];
+  if (!chartData) return;
+  const sampleRow = chartData[0]?.[0] ?? '';
+  const lanes = (sampleRow.length === 8) ? 8 : 4;
+  notes     = parseNotes(chartData, lanes);
+  chartEndT = notes.reduce((m, n) => Math.max(m, n.endT ?? n.t), 0);
+  buildTimeline();
+  drawFrame(pausedAt);
+  drawTimeline(pausedAt);
+}
+
+// ─── Lane helpers ─────────────────────────────────────────────────────────────
+function laneX(lane) {
+  return MARGIN + lane * LANE_W + LANE_W / 2;
+}
+
+// ─── Draw: tap note via sprite ────────────────────────────────────────────────
+function drawTapNote(x, y, lane, ri, numRows, alpha) {
+  const tapImg = img.tapNote;
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, alpha);
+  ctx.translate(x, y);
+  ctx.rotate(SPRITE_ROT[lane % 4]);
+
+  if (tapImg?.naturalWidth) {
+    const fw  = tapImg.naturalWidth  / SPRITE_COLS;
+    const fh  = tapImg.naturalHeight / SPRITE_ROWS;
+    const row = spriteRow(ri, numRows);
+    ctx.drawImage(tapImg,
+      SPRITE_COL * fw, row * fh, fw, fh,
+      -NOTE_SIZE / 2, -NOTE_SIZE / 2, NOTE_SIZE, NOTE_SIZE);
+  } else {
+    // Fallback: simple colored arrow path (points down before rotation)
+    const r = NOTE_SIZE / 2;
+    ctx.beginPath();
+    ctx.moveTo(0, r);
+    ctx.lineTo( r * 0.55, r * 0.08);
+    ctx.lineTo( r * 0.27, r * 0.08);
+    ctx.lineTo( r * 0.27, -r * 0.72);
+    ctx.lineTo(-r * 0.27, -r * 0.72);
+    ctx.lineTo(-r * 0.27, r * 0.08);
+    ctx.lineTo(-r * 0.55, r * 0.08);
+    ctx.closePath();
+    ctx.fillStyle = LANE_COL[lane % 4];
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+// ─── Draw: receptor (Tap Flash) ───────────────────────────────────────────────
+function drawReceptors() {
+  const flashImg = img.tapFlash;
+
+  for (let lane = 0; lane < nLanes; lane++) {
+    const x = laneX(lane);
+    ctx.save();
+    ctx.translate(x, RECEPTOR_Y);
+    ctx.rotate(SPRITE_ROT[lane % 4]);
+
+    if (flashImg?.naturalWidth) {
+      ctx.globalAlpha = 0.75;
+      ctx.drawImage(flashImg,
+        -NOTE_SIZE / 2, -NOTE_SIZE / 2,
+        NOTE_SIZE, NOTE_SIZE);
+    } else {
+      // Fallback: outlined arrow pointing down before rotation
+      const r = NOTE_SIZE / 2;
+      ctx.beginPath();
+      ctx.moveTo(0, r);
+      ctx.lineTo( r * 0.55, r * 0.08);
+      ctx.lineTo( r * 0.27, r * 0.08);
+      ctx.lineTo( r * 0.27, -r * 0.72);
+      ctx.lineTo(-r * 0.27, -r * 0.72);
+      ctx.lineTo(-r * 0.27, r * 0.08);
+      ctx.lineTo(-r * 0.55, r * 0.08);
+      ctx.closePath();
+      ctx.strokeStyle = LANE_COL[lane % 4];
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.4;
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  // Dashed guide line at receptor
+  ctx.save();
+  ctx.strokeStyle = '#334466';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 5]);
+  ctx.beginPath();
+  ctx.moveTo(MARGIN, RECEPTOR_Y);
+  ctx.lineTo(MARGIN + nLanes * LANE_W, RECEPTOR_Y);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ─── Draw: hold note body ─────────────────────────────────────────────────────
+function drawHold(note, currentT) {
+  const headY = RECEPTOR_Y + (note.t   - currentT) * scrollSpeed;
+  const tailY = note.endT !== null
+    ? RECEPTOR_Y + (note.endT - currentT) * scrollSpeed
+    : headY + 10;
+
+  const top = Math.min(headY, tailY);
+  const bot = Math.max(headY, tailY);
+  if (top > canvas.height + 50) return;
+  if (bot < RECEPTOR_Y - NOTE_SIZE / 2) return;
+
+  const rl      = remapLane(note.lane);
+  const x       = laneX(rl);
+  const drawW   = NOTE_SIZE;
+  const holdImg = img[HOLD_IMG_KEY[rl % 4]];
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x - drawW / 2, top, drawW, bot - top);
+  ctx.clip();
+
+  if (holdImg?.naturalWidth) {
+    ctx.globalAlpha = 0.9;
+    const tileH = holdImg.naturalHeight * (drawW / holdImg.naturalWidth);
+    let ty = top;
+    while (ty < bot) {
+      ctx.drawImage(holdImg, x - drawW / 2, ty, drawW, tileH);
+      ty += tileH;
+    }
+  } else {
+    // Fallback gradient
+    ctx.globalAlpha = 0.8;
+    const grad = ctx.createLinearGradient(x - drawW / 2, 0, x + drawW / 2, 0);
+    grad.addColorStop(0,   '#111');
+    grad.addColorStop(0.5, LANE_COL[note.lane % 4]);
+    grad.addColorStop(1,   '#111');
+    ctx.fillStyle = grad;
+    ctx.fillRect(x - drawW / 2, top, drawW, bot - top);
+  }
+
+  ctx.restore();
+
+  // Tail cap
+  ctx.save();
+  ctx.globalAlpha = 0.85;
+  ctx.beginPath();
+  ctx.arc(x, bot, drawW / 3, 0, Math.PI * 2);
+  ctx.fillStyle = '#cccccc';
+  ctx.fill();
+  ctx.restore();
+}
+
+// ─── Draw: lane dividers & beat lines ────────────────────────────────────────
+function drawLanes() {
+  if (nLanes === 8) {
+    ctx.save();
+    ctx.strokeStyle = '#3a3a55';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const cx = MARGIN + 4 * LANE_W;
+    ctx.moveTo(cx, 0);
+    ctx.lineTo(cx, canvas.height);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.save();
+  ctx.strokeStyle = '#1a1a30';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= nLanes; i++) {
+    const x = MARGIN + i * LANE_W;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, canvas.height);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawBeatLines(currentT) {
+  const beatDur = 60 / baseBpm;
+  const tBottom = currentT + (canvas.height - RECEPTOR_Y) / scrollSpeed;
+  const tTop    = currentT - RECEPTOR_Y / scrollSpeed;
+  const first   = Math.floor(tTop    / beatDur);
+  const last    = Math.ceil(tBottom  / beatDur);
+
+  for (let b = first; b <= last; b++) {
+    const y         = RECEPTOR_Y + (b * beatDur - currentT) * scrollSpeed;
+    const isMeasure = b % 4 === 0;
+    ctx.save();
+    ctx.strokeStyle = isMeasure ? '#2a2a55' : '#18182e';
+    ctx.lineWidth   = isMeasure ? 1.5 : 0.8;
+    ctx.beginPath();
+    ctx.moveTo(MARGIN, y);
+    ctx.lineTo(MARGIN + nLanes * LANE_W, y);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// ─── Main render ─────────────────────────────────────────────────────────────
+function drawFrame(currentT) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawLanes();
+  drawBeatLines(currentT);
+  drawReceptors();
+
+  // Hold bodies behind note heads
+  for (const n of notes) {
+    if (n.type === 'hold') drawHold(n, currentT);
+  }
+
+  // Tap notes and hold heads
+  for (const n of notes) {
+    const y = RECEPTOR_Y + (n.t - currentT) * scrollSpeed;
+    if (y > canvas.height + NOTE_SIZE) continue;
+    if (y < RECEPTOR_Y - NOTE_SIZE * 4) continue;
+
+    const alpha = y < RECEPTOR_Y
+      ? 1 - (RECEPTOR_Y - y) / (NOTE_SIZE * 2)
+      : 1;
+    const rl = remapLane(n.lane);
+    drawTapNote(laneX(rl), y, rl, n.ri, n.numRows, alpha);
+  }
+}
+
+// ─── Playback ────────────────────────────────────────────────────────────────
+async function play() {
+  await initAudio();
+  isPlaying = true;
+  playBtn.textContent = '⏸ Pause';
+  prevT = pausedAt;
+  startTime = performance.now() - (pausedAt / speedMult) * 1000;
+  rafId = requestAnimationFrame(tick);
+}
+
+function pause() {
+  isPlaying = false;
+  playBtn.textContent = '▶ Play';
+  if (rafId) cancelAnimationFrame(rafId);
+}
+
+function reset() {
+  pause();
+  pausedAt = 0;
+  prevT = 0;
+  timeDisp.textContent = '0.00 s';
+  drawFrame(0);
+  drawTimeline(0);
+}
+
+function tick(ts) {
+  const t = (ts - startTime) / 1000 * speedMult;
+  // checkClaps(prevT, t);
+  prevT = t;
+  pausedAt = t;
+  timeDisp.textContent = t.toFixed(2) + ' s';
+  drawFrame(t);
+  drawTimeline(t);
+  if (isPlaying) {
+    if (chartEndT > 0 && t >= chartEndT) { reset(); return; }
+    rafId = requestAnimationFrame(tick);
+  }
+}
+
+// ─── Control events ───────────────────────────────────────────────────────────
+playBtn.addEventListener('click', () => isPlaying ? pause() : play());
+resetBtn.addEventListener('click', reset);
+
+chartSelect.addEventListener('change', () => {
+  pause();
+  loadChart(parseInt(chartSelect.value));
+});
+
+turnSelect.addEventListener('change', () => {
+  turnMode = turnSelect.value;
+  if (!isPlaying) drawFrame(pausedAt);
+});
+
+scrollSlider.addEventListener('input', () => {
+  scrollSpeed = parseInt(scrollSlider.value);
+  scrollLabel.textContent = scrollSpeed;
+  if (!isPlaying) drawFrame(pausedAt);
+});
+
+speedSlider.addEventListener('input', () => {
+  speedMult = parseInt(speedSlider.value) / 100;
+  speedLabel.textContent = speedMult.toFixed(2);
+  if (isPlaying) {
+    startTime = performance.now() - (pausedAt / speedMult) * 1000;
+  } else {
+    drawFrame(pausedAt);
+  }
+});
+
+songSelect.addEventListener('change', () => {
+  const idx = parseInt(songSelect.value);
+  applyData(window.SONGS[idx]);
+});
+
+// ─── Apply loaded JSON ────────────────────────────────────────────────────────
+function applyData(data) {
+  window._allCharts = data.notes;
+
+  if (data.BPMS) {
+    baseBpm = parseBPM(data.BPMS);
+    bpmDisp.textContent = baseBpm;
+  }
+
+  if (data.TITLE || data.ARTIST) {
+    songInfo.textContent = `${data.TITLE ?? ''} / ${data.ARTIST ?? ''}`;
+  }
+
+  Array.from(chartSelect.options).forEach(opt => {
+    const idx = parseInt(opt.value);
+    opt.disabled = (data.notes[idx] == null);
+  });
+
+  loadChart(parseInt(chartSelect.value));
+}
+
+// ─── Initial load ─────────────────────────────────────────────────────────────
+async function init() {
+  resizeTimeline();
+  await imagesReady;
+
+  const songs = window.SONGS || [];
+  songs.forEach((s, i) => {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = `${s.TITLE ?? s.title ?? '曲' + i}${s.ARTIST ?? s.artist ? ' / ' + (s.ARTIST ?? s.artist) : ''}`;
+    songSelect.appendChild(opt);
+  });
+
+  if (songs.length > 0) applyData(songs[0]);
+  else { drawFrame(0); drawTimeline(0); }
+}
+
+init();
+</script>
+</body>
+</html>
